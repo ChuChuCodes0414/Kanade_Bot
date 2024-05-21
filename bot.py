@@ -1,5 +1,5 @@
 import discord
-from discord.ext import commands,tasks
+from discord.ext import commands, tasks
 from discord import app_commands
 import aiohttp
 import os
@@ -19,22 +19,28 @@ class Client(commands.Bot):
         intents.members = True
         intents.message_content = True
         self.dbclient = pymongo_client.get_client()
-        self.db = self.dbclient.ena_bot
+        self.db = self.dbclient.kanade_bot
 
-        super().__init__(command_prefix = "e!",help_command = None, intents = intents,activity = discord.Game("/about | @Ena Bot"))
-        
+        super().__init__(
+            command_prefix="k!",
+            help_command=None,
+            intents=intents,
+            activity=discord.Game("@Kanade Bot"),
+        )
+
     async def setup_hook(self):
         self.session = aiohttp.ClientSession()
-        self._BotBase__cogs  = commands.core._CaseInsensitiveDict()
+        self._BotBase__cogs = commands.core._CaseInsensitiveDict()
         await self.load_extension("jishaku")
-        for filename in os.listdir('./cogs'):
-            if filename.endswith('.py'):
-                await self.load_extension(f'cogs.{filename[:-3]}')
-        
+        for filename in os.listdir("./cogs"):
+            if filename.endswith(".py"):
+                await self.load_extension(f"cogs.{filename[:-3]}")
+
     async def on_ready(self):
-        print('Bot is online, and cogs are loaded.')
+        print("Bot is online, and cogs are loaded.")
+
 
 client = Client()
 
 load_dotenv()
-client.run(os.getenv('BOT_TOKEN'))
+client.run(os.getenv("BOT_TOKEN"))
