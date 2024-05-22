@@ -9,7 +9,7 @@ from utils import errors, methods
 
 class Template(commands.Cog):
     """
-    Mod commands.
+    Insert a description of the cog here
     """
 
     def __init__(self, client):

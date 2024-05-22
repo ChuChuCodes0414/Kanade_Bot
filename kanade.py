@@ -1,13 +1,8 @@
 import discord
-from discord.ext import commands, tasks
-from discord import app_commands
+from discord.ext import commands
 import aiohttp
 import os
 from dotenv import load_dotenv
-import asyncio
-from googletrans import Translator
-from langcodes import *
-import json
 from utils import pymongo_client
 
 

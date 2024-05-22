@@ -1,8 +1,9 @@
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 import datetime
 import asyncio
+import asyncpg
 import uuid
 
 from utils import errors, methods
@@ -16,6 +17,9 @@ class Mod(commands.Cog):
     def __init__(self, client):
         self.client = client
         self.short = "haha mod commands funny"
+
+        self.poll_expirations.add_exception_type(asyncpg.PostgresConnectionError)
+        self.poll_expirations.start()
 
     def mod_role_check():
         async def predicate(ctx):
@@ -36,6 +40,24 @@ class Mod(commands.Cog):
 
         return commands.check(predicate)
 
+    async def pull_initial_expiration(
+        self,
+        ctx: commands.Context,
+        action: str,
+        length: datetime.timedelta,
+        category: str = None,
+    ):
+        if not category:
+            category = "default"
+
+        raw = ctx.cog.client.db.guild_data.find_one(
+            {"_id": ctx.guild.id}, {f"settings.mod.expirations.{category}": 1}
+        )
+        duration = methods.query(
+            data=raw, search=["settings", "mod", "expirations", category]
+        )
+        return datetime.timedelta(hours=duration)
+
     async def push_reprimand(
         self,
         ctx: commands.Context,
@@ -47,7 +69,13 @@ class Mod(commands.Cog):
         category: str = None,
         timestamp: datetime.datetime = None,
         id: str = None,
+        length: datetime.timedelta = None,
     ):
+        length = length or await self.pull_initial_expiration(
+            ctx, action, length, category=category
+        )
+        expiration = datetime.datetime.now() + length
+
         reprimand = {
             "moderator": moderator.id,
             "action": action,
@@ -56,20 +84,52 @@ class Mod(commands.Cog):
             "category": category,
             "timestamp": timestamp or datetime.datetime.now(),
             "id": id or str(uuid.uuid4()),
+            "expiration": expiration,
+            "expired": False,
         }
         result = self.client.db.guild_data.update_one(
             {"_id": ctx.guild.id},
             {"$push": {f"mod.reprimands.{user.id}": reprimand}},
             upsert=True,
         )
+        self.client.db.global_data.update_one(
+            {"_id": "mod"},
+            {"$set": {f"expirations": {reprimand["id"]: {"time":expiration,"guild":ctx.guild.id,"user":user.id}}}},
+            upsert=True,
+        )
+        self.expirations[reprimand["id"]] = expiration
         return result, reprimand["id"]
+
+    @tasks.loop(minutes=5)
+    async def poll_expirations(self):
+        async with self.client.pool.acquire() as con:
+            raw = self.client.db.global_data.find_one(
+                {"_id": "mod"}, {f"expirations": 1}
+            )
+            expirations = methods.query(data=raw, search=["expirations"])
+            for id,data in expirations.items():
+                if data["time"] >= datetime.datetime.now():
+                    self.client.db.global_data.update_one(
+                        {"_id": "mod"},
+                        {"$unset": {f"expirations.{id}": ""}},
+                    )
+                    self.client.db.guild_data.update_one(
+                        {"_id": data["guild"],f"mod.reprimands.{data["user"]}.id":data["id"]},
+                        {"$set": {f"mod.reprimands.{data["user"]}.$.expired":True}},
+                    )
+
+                    # create code to dm the person here
+
+    @poll_expirations.before_loop
+    async def before_poll_expirations(self):
+        await self.client.wait_until_ready()
 
     @commands.Cog.listener()
     async def on_ready(self):
         print("Mod Category Loaded.")
 
     @commands.hybrid_command(aliases=["w"], help="Warn a member")
-    @commands.has_permissions(ban_members=True)
+    @mod_role_check()
     @app_commands.describe(
         member="The member or user that should be warned.",
         category="The category this warn should go in.",
