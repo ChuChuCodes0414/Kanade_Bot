@@ -10,22 +10,21 @@ class Dev(commands.Cog):
     async def on_ready(self):
         print("Dev Category Loaded")
 
-    @commands.command(id = "00",hidden = True)
+    @commands.command(hidden = True)
     @commands.is_owner()
-    async def sync(self,ctx,type:str = None,guild:int = None):
-        async with ctx.typing():
-            type = type or "global"
-            guild = guild or ctx.guild.id
+    async def sync(self,ctx,type:str = None):
+        type = type or "global"
 
-            if type == "global":
-                response = await self.client.tree.sync()
-            elif type == "guild":
-                guild = self.client.get_guild(guild)
-                response = await self.client.tree.sync(guild = guild)
-            
-            await ctx.reply(embed = discord.Embed(description = f"Synced `{len(response)}` Commands to `{type}`!",color = discord.Color.green()))
+        if type == "global":
+            response = await self.client.tree.sync()
+        elif type == "guild":
+            guild = self.client.get_guild(870125583886065674)
+            self.client.tree.copy_global_to(guild=guild)
+            response = await self.client.tree.sync(guild = guild)
+        
+        await ctx.reply(embed = discord.Embed(description = f"Synced `{len(response)}` Commands to `{type}`!",color = discord.Color.green()))
     
-    @commands.command(id = "01",hidden=True)
+    @commands.command(hidden=True)
     @commands.is_owner()
     async def reload(self,ctx,extension):
         await self.client.reload_extension(f'cogs.{extension}')
@@ -38,7 +37,7 @@ class Dev(commands.Cog):
     async def reload_error(self,ctx, error):
         await ctx.reply(embed = discord.Embed(description = f'`{error}`',color = discord.Color.red()))
     
-    @commands.command(id = "02",hidden=True)
+    @commands.command(hidden=True)
     @commands.is_owner()
     async def load(self,ctx,extension):
         await self.client.load_extension(f'cogs.{extension}')
@@ -51,7 +50,7 @@ class Dev(commands.Cog):
     async def load_error(self,ctx, error):
         await ctx.reply(embed = discord.Embed(description = f'`{error}`',color = discord.Color.red()))
     
-    @commands.command(id = "03",hidden=True)
+    @commands.command(hidden=True)
     @commands.is_owner()
     async def unload(self,ctx,extension):
         await self.client.unload_extension(f'cogs.{extension}')

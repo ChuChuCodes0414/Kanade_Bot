@@ -3,7 +3,6 @@ from discord.ext import commands
 import math
 import traceback
 import sys
-import genshin
 import uuid
 import datetime
 import os
