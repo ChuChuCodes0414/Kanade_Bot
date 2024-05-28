@@ -69,7 +69,10 @@ class Mod(commands.Cog):
         length = length or await self.pull_initial_expiration(
             ctx, action, category=category
         )
-        expiration = datetime.datetime.now() + length
+        if length:
+            expiration = datetime.datetime.now() + length
+        else:
+            expiration = None
 
         reprimand = {
             "moderator": moderator.id,
@@ -87,31 +90,36 @@ class Mod(commands.Cog):
             {"$push": {f"mod.reprimands.{user.id}": reprimand}},
             upsert=True,
         )
-        self.client.db.global_data.update_one(
-            {"_id": "mod"},
-            {
-                "$set": {
-                    f"expirations": {
-                        reprimand["id"]: {
+        if expiration:
+            self.client.db.global_data.update_one(
+                {"_id": "mod"},
+                {
+                    "$set": {
+                        f"expirations.{reprimand['id']}": {
                             "time": expiration,
                             "guild": ctx.guild.id,
                             "user": user.id,
                         }
                     }
-                }
-            },
-            upsert=True,
-        )
+                },
+                upsert=True,
+            )
         return reprimand
 
-    async def send_reprimand_dm(self, user: discord.User,guild: discord.Guild, reprimand: dict):
+    async def send_reprimand_dm(
+        self,
+        user: discord.User,
+        guild: discord.Guild,
+        reprimand: dict,
+        additional: list = None,
+    ):
         try:
             dm = user.dm_channel
             if dm == None:
                 dm = await user.create_dm()
             embed = discord.Embed(
                 color=discord.Color.yellow(),
-                title=f"Expired Warning: {reprimand['id']}",
+                title=f"Added {reprimand['action'].capitalize()}: {reprimand['id']}",
                 description=f"Added {reprimand['action']} to {user.mention} {reprimand['amount']} time(s).",
                 timestamp=discord.utils.utcnow(),
             )
@@ -130,6 +138,8 @@ class Mod(commands.Cog):
             embed.add_field(
                 name="Category", value=reprimand["category"] or "None", inline=True
             )
+            if additional and len(additional) > 0:
+                embed.add_field(name="Triggers", value="\n".join(additional))
             embed.set_thumbnail(url=user.display_avatar.url)
             await dm.send(embed=embed)
         except:
@@ -144,8 +154,8 @@ class Mod(commands.Cog):
                 dm = await user.create_dm()
             embed = discord.Embed(
                 color=discord.Color.yellow(),
-                title=f"Expired {reprimand['action']}: {reprimand['id']}",
-                description=f"Expired {reprimand['amount']} {reprimand['action']}(s) for {user.mention}",
+                title=f"Pardoned {reprimand['action']}: {reprimand['id']}",
+                description=f"Pardoned {reprimand['amount']} {reprimand['action']}(s) for {user.mention}",
                 timestamp=discord.utils.utcnow(),
             )
             embed.set_author(
@@ -197,9 +207,10 @@ class Mod(commands.Cog):
         )
         return list(raw)
 
-    async def pull_reprimand(self, user: discord.User, id: str):
+    async def pull_reprimand(self, user: discord.User, guild: discord.Guild, id: str):
         raw = self.client.db.guild_data.aggregate(
             [
+                {"$match": {"_id": guild.id}},
                 {
                     "$project": {
                         f"mod.reprimands.{user.id}": {
@@ -230,23 +241,21 @@ class Mod(commands.Cog):
         else:
             return None
 
+    async def update_reprimand(
+        self, user: discord.User, guild: discord.Guild, id: str, updates: list
+    ):
+        update_set = {f"mod.reprimands.{user.id}.$.{a}": b for a, b in updates}
+        self.client.db.guild_data.update_one(
+            {
+                "_id": guild.id,
+                f"mod.reprimands.{user.id}.id": id,
+            },
+            {"$set": update_set},
+        )
+
     async def pull_active_total(
         self, user: discord.User, guild: discord.guild, action: str
     ):
-        raw = await self.pull_reprimands(
-            user,
-            guild,
-            [
-                {"key": "expired", "value": False},
-                {"key": "action", "value": "warn"},
-            ],
-        )
-        if len(raw) > 0:
-            active = methods.query(
-                data=raw[0], search=["mod", "reprimands", str(user.id)]
-            )
-        else:
-            active = []
         raw = await self.pull_reprimands(
             user,
             guild,
@@ -260,7 +269,134 @@ class Mod(commands.Cog):
             )
         else:
             total = []
-        return len(active), len(total)
+        acount, tcount = 0, 0
+        for reprimand in total:
+            if not reprimand["expired"]:
+                acount += reprimand["amount"]
+            tcount += reprimand["amount"]
+        return acount, tcount
+
+    async def trigger_reprimand(
+        self, ctx: commands.Context, user: discord.User, reprimand: dict
+    ):
+        additional = []
+        raw = self.client.db.guild_data.find_one(
+            {"_id": ctx.guild.id},
+            {
+                f"settings.mod.triggers.{reprimand['category'] or 'default'}.{reprimand['action']}": 1
+            },
+        )
+        triggers = methods.query(
+            data=raw,
+            search=[
+                "settings",
+                "mod",
+                "triggers",
+                reprimand["category"] or "default",
+                reprimand["action"],
+            ],
+        )
+        active, total = await self.pull_active_total(
+            user, ctx.guild, reprimand["action"]
+        )
+        for trigger in triggers:
+            if trigger["count"] == "active":
+                at = active
+            else:
+                at = total
+            if (
+                (trigger["type"] == "exact" and at == trigger["threshold"])
+                or (trigger["type"] == "retroactive" and at >= trigger["threshold"])
+                or (trigger["type"] == "multiple" and at % trigger["threshold"] == 0)
+            ):
+                if trigger["action"] == "mute":
+                    raw = self.db.guild_data.find_one(
+                        {"_id": ctx.guild.id}, {"settings.mod.roles.mute": 1}
+                    )
+                    role = ctx.guild.get_role(
+                        methods.query(
+                            data=raw, search=["settings", "mod", "roles", "mute"]
+                        )
+                    )
+                    member = ctx.guild.get_member(user.id)
+                    if member:
+                        await member.add_roles(
+                            (role),
+                            reason=f"Automatic trigger applied at {at} {reprimand['action']}(s) in {reprimand['category'] or 'default'}.",
+                        )
+                elif trigger["action"] == "ban":
+                    await member.ban(
+                        reason=f"Automatic trigger applied at {at} {reprimand['action']}(s) in {reprimand['category'] or 'default'}.",
+                        delete_message_days=0,
+                    )
+                reprimand = await self.push_reprimand(
+                    ctx,
+                    user,
+                    self.client.user,
+                    trigger["action"],
+                    reason=f"Automatic trigger applied at {at} {reprimand['action']}(s) in {reprimand['category'] or 'default'}",
+                    amount=trigger["amount"],
+                    category=trigger["category"],
+                    timestamp=datetime.datetime.now(),
+                    length=(
+                        datetime.timedelta(hours=trigger["length"])
+                        if trigger["length"]
+                        else None
+                    ),
+                )
+                unix = (
+                    int(reprimand["expiration"].timestamp())
+                    if reprimand["expiration"]
+                    else None
+                )
+                additional.append(
+                    f"Automatic trigger applied at threshold {at} {reprimand['action']}(s) in {reprimand['category'] or 'default'} applied an additional {trigger['amount']} {trigger['action']}(s) in {trigger['category'] or 'default'}"
+                    + f" in effect until <t:{unix}:f> (<t:{unix}:R>)."
+                    if reprimand["expiration"]
+                    else " in effect indefinitely."
+                )
+        return additional
+
+    async def pull_mod_embed(
+        self,
+        ctx: commands.Context,
+        user: discord.User,
+        reprimand: dict,
+        additional: list,
+    ):
+        unix = (
+            int(reprimand["expiration"].timestamp())
+            if reprimand["expiration"]
+            else None
+        )
+        embed = discord.Embed(
+            color=discord.Color.yellow(),
+            title=f"Added {reprimand['action'].capitalize()}: {reprimand['id']}",
+            description=(
+                f"Added {reprimand['action']} to {user.mention} {reprimand['amount']} time(s)"
+                + f" in effect until <t:{unix}:f> (<t:{unix}:R>)."
+                if reprimand["expiration"]
+                else " in effect indefinitely."
+            ),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.set_author(name=f"{user} ({user.id})", icon_url=user.display_avatar.url)
+        embed.add_field(
+            name="Reason", value=reprimand["reason"] or "No reason given.", inline=False
+        )
+        active, total = await self.pull_active_total(user, ctx.guild, "warn")
+        embed.add_field(name="Active", value=str(active), inline=True)
+        embed.add_field(name="Total", value=str(total), inline=True)
+        embed.add_field(
+            name="Category", value=reprimand["category"] or "None", inline=True
+        )
+        if len(additional) > 0:
+            embed.add_field(name="Triggers", value="\n".join(additional))
+        embed.set_footer(
+            text=f"Requested by {ctx.author} ({ctx.author.id})",
+            icon_url=ctx.author.display_avatar.url,
+        )
+        return embed
 
     @tasks.loop(seconds=30)
     async def poll_expirations(self):
@@ -273,16 +409,44 @@ class Mod(commands.Cog):
                         {"_id": "mod"},
                         {"$unset": {f"expirations.{id}": ""}},
                     )
-                    self.client.db.guild_data.update_one(
-                        {
-                            "_id": data["guild"],
-                            f"mod.reprimands.{data['user']}.id": id,
-                        },
-                        {"$set": {f"mod.reprimands.{data['user']}.$.expired": True}},
-                    )
-
                     user = await self.client.fetch_user(data["user"])
-                    reprimand = await self.pull_reprimand(user, id)
+                    guild = self.client.get_guild(data["guild"])
+                    await self.update_reprimand(
+                        user,
+                        guild,
+                        id,
+                        [
+                            ("expired", True),
+                            (
+                                "ereason",
+                                f"{reprimand['action'].capitalize()} has expired.",
+                            ),
+                        ],
+                    )
+                    reprimand = await self.pull_reprimand(user, guild, id)
+                    if reprimand["action"] == "mute":
+                        raw = self.db.guild_data.find_one(
+                            {"_id": data["guild"]}, {"settings.mod.roles.mute": 1}
+                        )
+                        role = guild.get_role(
+                            methods.query(
+                                data=raw, search=["settings", "mod", "roles", "mute"]
+                            )
+                        )
+                        member = guild.get_member(data["user"])
+                        if member:
+                            await member.remove_roles(
+                                (role),
+                                reason=f"{reprimand['action'].capitalize()} has expired.",
+                            )
+                    if reprimand["action"] == "ban":
+                        try:
+                            await guild.unban(
+                                user,
+                                reason=f"{reprimand['action'].capitalize()} has expired.",
+                            )
+                        except:
+                            pass
                     await self.send_pardon_dm(
                         user,
                         self.client.get_guild(data["guild"]),
@@ -315,7 +479,7 @@ class Mod(commands.Cog):
         member: discord.Member,
         *,
         category: str = None,
-        amount: commands.Range[int,0] = None,
+        amount: commands.Range[int, 0] = None,
         reason: str = None,
     ):
         async with ctx.typing():
@@ -329,29 +493,130 @@ class Mod(commands.Cog):
                 amount=amount,
                 category=category,
             )
-            embed = discord.Embed(
-                color=discord.Color.yellow(),
-                title=f"Added Warning: {reprimand['id']}",
-                description=f"Added warn to {member.mention} {amount} time(s).",
-                timestamp=discord.utils.utcnow(),
+            additional = await self.trigger_reprimand(ctx, member, reprimand)
+            embed = await self.pull_mod_embed(ctx, member, reprimand, additional)
+            view = ReprimandUpdatePersistentView(ctx, member, reprimand, embed)
+            await ctx.reply(embed=embed, view=view)
+            await self.send_reprimand_dm(
+                member, ctx.guild, reprimand, additional=additional
             )
-            embed.set_author(
-                name=f"{member} ({member.id})", icon_url=member.display_avatar.url
-            )
-            embed.add_field(
-                name="Reason", value=reason or "No reason given.", inline=False
-            )
-            active, total = await self.pull_active_total(member, ctx.guild, "warn")
-            embed.add_field(name="Active", value=str(active), inline=True)
-            embed.add_field(name="Total", value=str(total), inline=True)
-            embed.add_field(name="Category", value=category or "None", inline=True)
-            embed.set_footer(
-                text=f"Requested by {ctx.author} ({ctx.author.id})",
-                icon_url=ctx.author.display_avatar.url,
-            )
-            embed.set_thumbnail(url=member.display_avatar.url)
-            await ctx.reply(embed=embed)
-            await self.send_reprimand_dm(member,ctx.guild,reprimand)
+
+
+class ReprimandUpdatePersistentView(discord.ui.View):
+    def __init__(
+        self,
+        ctx: commands.Context,
+        user: discord.User,
+        reprimand: dict,
+        embed: discord.Embed,
+    ):
+        super().__init__(timeout=None)
+        self.user = user
+        self.reprimand = reprimand
+        self.embed = embed
+        self.ctx = ctx
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if interaction.user == self.ctx.author:
+            return True
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                description="This menu is not for you!", color=discord.Color.red()
+            ),
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(
+        label="Update", custom_id="reprimand_update_persistent_view:update"
+    )
+    async def update(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(
+            ReprimandReasonUpdateModal(self.user, self.reprimand, self.embed)
+        )
+
+    @discord.ui.button(
+        label="Pardon", custom_id="reprimand_update_persistent_view:pardon"
+    )
+    async def pardon(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(
+            ReprimandPardonModal(self.user, self.reprimand, self.embed)
+        )
+
+    @discord.ui.button(
+        label="Delete",
+        style=discord.ButtonStyle.red,
+        custom_id="reprimand_update_persistent_view:delete",
+    )
+    async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pass
+
+
+class ReprimandReasonUpdateModal(discord.ui.Modal):
+    def __init__(self, user: discord.User, reprimand: dict, embed: discord.Embed):
+        super().__init__(title=f"Update {reprimand['id']}")
+        self.reprimand = reprimand
+        self.embed = embed
+        self.user = user
+
+    reason = discord.ui.TextInput(
+        label="New Reason",
+        placeholder="New reason for this reprimand.",
+        style=discord.TextStyle.paragraph,
+        required=False,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.client.get_cog("mod").update_reprimand(
+            self.user,
+            interaction.guild,
+            self.reprimand["id"],
+            [("reason", self.reason.value)],
+        )
+        self.embed.set_field_at(
+            index=0, name="Reason", value=self.reason.value, inline=False
+        )
+        await interaction.response.edit_message(embed=self.embed)
+
+
+class ReprimandPardonModal(discord.ui.Modal):
+    def __init__(self, user: discord.User, reprimand: dict, embed: discord.Embed):
+        super().__init__(title=f"Pardon {reprimand['id']}")
+        self.reprimand = reprimand
+        self.embed = embed
+        self.user = user
+
+    reason = discord.ui.TextInput(
+        label="Pardon Reason",
+        placeholder="Parson reason for this reprimand.",
+        style=discord.TextStyle.paragraph,
+        required=False,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.client.get_cog("mod").update_reprimand(
+            self.user,
+            interaction.guild,
+            self.reprimand["id"],
+            [("expired", True), ("ereason", self.reason.value)],
+        )
+        await interaction.client.get_cog("mod").send_pardon_dm(
+            self.user, interaction.guild, self.reprimand, self.reason.value
+        )
+        interaction.client.db.global_data.update_one(
+            {"_id": "mod"},
+            {"$unset": {f"expirations.{self.reprimand['id']}": ""}},
+        )
+        self.embed.insert_field_at(
+            index=1, name="Pardoned Reason", value=self.reason.value, inline=False
+        )
+        self.embed.set_field_at(
+            index=2, name="Active", value=int(self.embed.fields[2].value)-1, inline=False
+        )
+        self.embed.color = discord.Color.green()
+        self.embed.title = f"Pardoned {self.reprimand['action'].capitalize()}: {self.reprimand['id']}"
+        self.embed.description = self.embed.description.replace(self.embed.description[:self.embed.description.index(" ")],"Pardoned",1)
+        await interaction.response.edit_message(embed=self.embed)
 
 
 async def setup(client):
