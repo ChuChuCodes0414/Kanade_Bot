@@ -51,7 +51,7 @@ class Mod(commands.Cog):
         duration = methods.query(
             data=raw, search=["settings", "mod", "expirations", category, action]
         )
-        return datetime.timedelta(hours=duration)
+        return datetime.timedelta(hours=duration) if duration else None
 
     async def push_reprimand(
         self,
@@ -117,10 +117,19 @@ class Mod(commands.Cog):
             dm = user.dm_channel
             if dm == None:
                 dm = await user.create_dm()
+            unix = (
+                int(reprimand["expiration"].timestamp())
+                if reprimand["expiration"]
+                else None
+            )
             embed = discord.Embed(
                 color=discord.Color.yellow(),
                 title=f"Added {reprimand['action'].capitalize()}: {reprimand['id']}",
-                description=f"Added {reprimand['action']} to {user.mention} {reprimand['amount']} time(s).",
+                description=(
+                    f"Added {reprimand['action']} to {user.mention} {reprimand['amount']} time(s) in effect until <t:{unix}:f> (<t:{unix}:R>)."
+                    if reprimand["expiration"]
+                    else f"Added {reprimand['action']} to {user.mention} {reprimand['amount']} time(s)"
+                ),
                 timestamp=discord.utils.utcnow(),
             )
             embed.set_author(
@@ -253,6 +262,71 @@ class Mod(commands.Cog):
             {"$set": update_set},
         )
 
+    async def delete_reprimand(self, user: discord.User, guild: discord.Guild, id: str):
+        self.client.db.global_data.update_one(
+            {"_id": "mod"},
+            {"$unset": {f"expirations.{id}": ""}},
+        )
+        self.client.db.guild_data.update_one(
+            {
+                "_id": guild.id,
+                f"mod.reprimands.{user.id}.id": id,
+            },
+            {"$pull": {f"mod.reprimands.{user.id}": {"id": id}}},
+        )
+
+    async def pardon_reprimand(
+        self,
+        user: discord.User,
+        guild: discord.Guild,
+        reprimand: dict,
+        preason: str,
+        revoke: bool = True,
+    ):
+        self.client.db.global_data.update_one(
+            {"_id": "mod"},
+            {"$unset": {f"expirations.{reprimand['id']}": ""}},
+        )
+        await self.update_reprimand(
+            user,
+            guild,
+            reprimand["id"],
+            [
+                ("expired", True),
+                (
+                    "ereason",
+                    preason,
+                ),
+            ],
+        )
+        if revoke and reprimand["action"] == "mute":
+            raw = self.db.guild_data.find_one(
+                {"_id": guild.id}, {"settings.mod.roles.mute": 1}
+            )
+            role = guild.get_role(
+                methods.query(data=raw, search=["settings", "mod", "roles", "mute"])
+            )
+            member = guild.get_member(user.id)
+            if member:
+                await member.remove_roles(
+                    (role),
+                    reason=f"{reprimand['action'].capitalize()} has expired.",
+                )
+        elif revoke and reprimand["action"] == "ban":
+            try:
+                await guild.unban(
+                    user,
+                    reason=f"{reprimand['action'].capitalize()} has expired.",
+                )
+            except:
+                pass
+        await self.send_pardon_dm(
+            user,
+            guild,
+            reprimand,
+            f"{reprimand['action'].capitalize()} has expired.",
+        )
+
     async def pull_active_total(
         self, user: discord.User, guild: discord.guild, action: str
     ):
@@ -350,10 +424,9 @@ class Mod(commands.Cog):
                     else None
                 )
                 additional.append(
-                    f"Automatic trigger applied at threshold {at} {reprimand['action']}(s) in {reprimand['category'] or 'default'} applied an additional {trigger['amount']} {trigger['action']}(s) in {trigger['category'] or 'default'}"
-                    + f" in effect until <t:{unix}:f> (<t:{unix}:R>)."
+                    f"Automatic trigger applied at threshold {at} {reprimand['action']}(s) in {reprimand['category'] or 'default'} applied an additional {trigger['amount']} {trigger['action']}(s) in {trigger['category'] or 'default'} in effect until <t:{unix}:f> (<t:{unix}:R>)."
                     if reprimand["expiration"]
-                    else " in effect indefinitely."
+                    else f"Automatic trigger applied at threshold {at} {reprimand['action']}(s) in {reprimand['category'] or 'default'} applied an additional {trigger['amount']} {trigger['action']}(s) in {trigger['category'] or 'default'}"
                 )
         return additional
 
@@ -373,10 +446,9 @@ class Mod(commands.Cog):
             color=discord.Color.yellow(),
             title=f"Added {reprimand['action'].capitalize()}: {reprimand['id']}",
             description=(
-                f"Added {reprimand['action']} to {user.mention} {reprimand['amount']} time(s)"
-                + f" in effect until <t:{unix}:f> (<t:{unix}:R>)."
+                f"Added {reprimand['action']} to {user.mention} {reprimand['amount']} time(s) in effect until <t:{unix}:f> (<t:{unix}:R>)."
                 if reprimand["expiration"]
-                else " in effect indefinitely."
+                else f"Added {reprimand['action']} to {user.mention} {reprimand['amount']} time(s)"
             ),
             timestamp=discord.utils.utcnow(),
         )
@@ -405,51 +477,12 @@ class Mod(commands.Cog):
         if expirations:
             for id, data in expirations.items():
                 if data["time"] <= datetime.datetime.now():
-                    self.client.db.global_data.update_one(
-                        {"_id": "mod"},
-                        {"$unset": {f"expirations.{id}": ""}},
-                    )
                     user = await self.client.fetch_user(data["user"])
                     guild = self.client.get_guild(data["guild"])
-                    await self.update_reprimand(
+                    reprimand = await self.pull_reprimand(user, guild, id)
+                    await self.pardon_reprimand(
                         user,
                         guild,
-                        id,
-                        [
-                            ("expired", True),
-                            (
-                                "ereason",
-                                f"{reprimand['action'].capitalize()} has expired.",
-                            ),
-                        ],
-                    )
-                    reprimand = await self.pull_reprimand(user, guild, id)
-                    if reprimand["action"] == "mute":
-                        raw = self.db.guild_data.find_one(
-                            {"_id": data["guild"]}, {"settings.mod.roles.mute": 1}
-                        )
-                        role = guild.get_role(
-                            methods.query(
-                                data=raw, search=["settings", "mod", "roles", "mute"]
-                            )
-                        )
-                        member = guild.get_member(data["user"])
-                        if member:
-                            await member.remove_roles(
-                                (role),
-                                reason=f"{reprimand['action'].capitalize()} has expired.",
-                            )
-                    if reprimand["action"] == "ban":
-                        try:
-                            await guild.unban(
-                                user,
-                                reason=f"{reprimand['action'].capitalize()} has expired.",
-                            )
-                        except:
-                            pass
-                    await self.send_pardon_dm(
-                        user,
-                        self.client.get_guild(data["guild"]),
                         reprimand,
                         f"{reprimand['action'].capitalize()} has expired.",
                     )
@@ -549,7 +582,30 @@ class ReprimandUpdatePersistentView(discord.ui.View):
         custom_id="reprimand_update_persistent_view:delete",
     )
     async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
-        pass
+        await interaction.client.get_cog("mod").delete_reprimand(
+            self.user, interaction.guild, self.reprimand["id"]
+        )
+        self.embed.color = discord.Color.red()
+        offset = 1 if self.embed.title.startswith("Pardoned") else 0
+        self.embed.title = (
+            f"Deleted {self.reprimand['action'].capitalize()}: {self.reprimand['id']}"
+        )
+        self.embed.set_field_at(
+            index=1 + offset,
+            name="Active",
+            value=int(self.embed.fields[1 + offset].value) - 1,
+            inline=True,
+        )
+        self.embed.set_field_at(
+            index=2 + offset,
+            name="Total",
+            value=int(self.embed.fields[2 + offset].value) - 1,
+            inline=True,
+        )
+        self.embed.description = self.embed.description.replace(
+            self.embed.description[: self.embed.description.index(" ")], "Deleted", 1
+        )
+        await interaction.response.edit_message(embed=self.embed, view=None)
 
 
 class ReprimandReasonUpdateModal(discord.ui.Modal):
@@ -594,13 +650,7 @@ class ReprimandPardonModal(discord.ui.Modal):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        await interaction.client.get_cog("mod").update_reprimand(
-            self.user,
-            interaction.guild,
-            self.reprimand["id"],
-            [("expired", True), ("ereason", self.reason.value)],
-        )
-        await interaction.client.get_cog("mod").send_pardon_dm(
+        await interaction.client.get_cog("mod").pardon_reprimand(
             self.user, interaction.guild, self.reprimand, self.reason.value
         )
         interaction.client.db.global_data.update_one(
@@ -611,11 +661,18 @@ class ReprimandPardonModal(discord.ui.Modal):
             index=1, name="Pardoned Reason", value=self.reason.value, inline=False
         )
         self.embed.set_field_at(
-            index=2, name="Active", value=int(self.embed.fields[2].value)-1, inline=False
+            index=2,
+            name="Active",
+            value=int(self.embed.fields[2].value) - 1,
+            inline=True,
         )
         self.embed.color = discord.Color.green()
-        self.embed.title = f"Pardoned {self.reprimand['action'].capitalize()}: {self.reprimand['id']}"
-        self.embed.description = self.embed.description.replace(self.embed.description[:self.embed.description.index(" ")],"Pardoned",1)
+        self.embed.title = (
+            f"Pardoned {self.reprimand['action'].capitalize()}: {self.reprimand['id']}"
+        )
+        self.embed.description = self.embed.description.replace(
+            self.embed.description[: self.embed.description.index(" ")], "Pardoned", 1
+        )
         await interaction.response.edit_message(embed=self.embed)
 
 
