@@ -16,6 +16,13 @@ class Mod(commands.Cog):
         self.client = client
         self.short = "haha mod commands funny"
         self.poll_expirations.start()
+        self.categories = {}
+
+    async def cache(self, data):
+        for guild in data:
+            self.categories[guild["_id"]] = (
+                guild.get("settings", {}).get("mod", {}).get("categories", [])
+            )
 
     def mod_role_check():
         async def predicate(ctx):
@@ -141,7 +148,9 @@ class Mod(commands.Cog):
                 value=reprimand["reason"] or "No reason given.",
                 inline=False,
             )
-            active, total = await self.pull_active_total(user, guild, "warn")
+            active, total = await self.pull_active_total(
+                user, guild, reprimand["action"], reprimand["category"]
+            )
             embed.add_field(name="Active", value=str(active), inline=True)
             embed.add_field(name="Total", value=str(total), inline=True)
             embed.add_field(
@@ -173,15 +182,17 @@ class Mod(commands.Cog):
             )
             embed.add_field(
                 name="Reason",
-                value=reprimand["reason"] or "No reason given.",
+                value=reprimand["reason"] or "No reason given",
                 inline=False,
             )
             embed.add_field(
                 name="Pardoned Reason",
-                value=reason or "No reason given.",
+                value=reason or "No reason given",
                 inline=False,
             )
-            active, total = await self.pull_active_total(user, guild, "warn")
+            active, total = await self.pull_active_total(
+                user, guild, reprimand["action"], category=reprimand["category"]
+            )
             embed.add_field(name="Active", value=str(active), inline=True)
             embed.add_field(name="Total", value=str(total), inline=True)
             embed.add_field(
@@ -328,13 +339,18 @@ class Mod(commands.Cog):
         )
 
     async def pull_active_total(
-        self, user: discord.User, guild: discord.guild, action: str
+        self,
+        user: discord.User,
+        guild: discord.guild,
+        action: str,
+        category: str = None,
     ):
         raw = await self.pull_reprimands(
             user,
             guild,
             [
-                {"key": "action", "value": "warn"},
+                {"key": "action", "value": action},
+                {"key": "category", "value": category},
             ],
         )
         if len(raw) > 0:
@@ -360,18 +376,21 @@ class Mod(commands.Cog):
                 f"settings.mod.triggers.{reprimand['category'] or 'default'}.{reprimand['action']}": 1
             },
         )
-        triggers = methods.query(
-            data=raw,
-            search=[
-                "settings",
-                "mod",
-                "triggers",
-                reprimand["category"] or "default",
-                reprimand["action"],
-            ],
+        triggers = (
+            methods.query(
+                data=raw,
+                search=[
+                    "settings",
+                    "mod",
+                    "triggers",
+                    reprimand["category"] or "default",
+                    reprimand["action"],
+                ],
+            )
+            or []
         )
         active, total = await self.pull_active_total(
-            user, ctx.guild, reprimand["action"]
+            user, ctx.guild, reprimand["action"], category=reprimand["category"]
         )
         for trigger in triggers:
             if trigger["count"] == "active":
@@ -453,10 +472,13 @@ class Mod(commands.Cog):
             timestamp=discord.utils.utcnow(),
         )
         embed.set_author(name=f"{user} ({user.id})", icon_url=user.display_avatar.url)
+        embed.set_thumbnail(url=user.display_avatar.url)
         embed.add_field(
             name="Reason", value=reprimand["reason"] or "No reason given.", inline=False
         )
-        active, total = await self.pull_active_total(user, ctx.guild, "warn")
+        active, total = await self.pull_active_total(
+            user, ctx.guild, reprimand["action"], category=reprimand["category"]
+        )
         embed.add_field(name="Active", value=str(active), inline=True)
         embed.add_field(name="Total", value=str(total), inline=True)
         embed.add_field(
@@ -516,6 +538,10 @@ class Mod(commands.Cog):
         reason: str = None,
     ):
         async with ctx.typing():
+            if category and category not in self.categories[ctx.guild.id]:
+                raise errors.ParsingError(
+                    message=f"The category `{category}` is not setup!"
+                )
             amount = amount or 1
             reprimand = await self.push_reprimand(
                 ctx,
@@ -533,6 +559,58 @@ class Mod(commands.Cog):
             await self.send_reprimand_dm(
                 member, ctx.guild, reprimand, additional=additional
             )
+
+    @commands.hybrid_command(aliases=["n"], help="Notice a member")
+    @mod_role_check()
+    @app_commands.describe(
+        member="The member or user that should be noticed.",
+        category="The category this notice should go in.",
+        reason="Why you are noticing this member.",
+        amount="The amount of notices that should be applied.",
+    )
+    async def notice(
+        self,
+        ctx,
+        member: discord.Member,
+        *,
+        category: str = None,
+        amount: commands.Range[int, 0] = None,
+        reason: str = None,
+    ):
+        async with ctx.typing():
+            if category and category not in self.categories[ctx.guild.id]:
+                raise errors.ParsingError(
+                    message=f"The category `{category}` is not setup!"
+                )
+            amount = amount or 1
+            reprimand = await self.push_reprimand(
+                ctx,
+                member,
+                ctx.author,
+                "notice",
+                reason=reason,
+                amount=amount,
+                category=category,
+            )
+            additional = await self.trigger_reprimand(ctx, member, reprimand)
+            embed = await self.pull_mod_embed(ctx, member, reprimand, additional)
+            view = ReprimandUpdatePersistentView(ctx, member, reprimand, embed)
+            await ctx.reply(embed=embed, view=view)
+            await self.send_reprimand_dm(
+                member, ctx.guild, reprimand, additional=additional
+            )
+
+    @warn.autocomplete("category")
+    @notice.autocomplete("category")
+    async def category_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ):
+        categories = self.categories.get(interaction.guild.id, [])
+        return [
+            app_commands.Choice(name=category, value=category)
+            for category in categories
+            if current.lower() in category.lower()
+        ][:10]
 
 
 class ReprimandUpdatePersistentView(discord.ui.View):
@@ -658,7 +736,10 @@ class ReprimandPardonModal(discord.ui.Modal):
             {"$unset": {f"expirations.{self.reprimand['id']}": ""}},
         )
         self.embed.insert_field_at(
-            index=1, name="Pardoned Reason", value=self.reason.value, inline=False
+            index=1,
+            name="Pardoned Reason",
+            value=self.reason.value or "No reason given",
+            inline=False,
         )
         self.embed.set_field_at(
             index=2,

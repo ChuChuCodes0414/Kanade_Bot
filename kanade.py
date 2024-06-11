@@ -30,6 +30,13 @@ class Client(commands.Bot):
         for filename in os.listdir("./cogs"):
             if filename.endswith(".py"):
                 await self.load_extension(f"cogs.{filename[:-3]}")
+    
+    async def load_caches(self):
+        data = list(self.db.guild_data.find({},{"settings":1}))
+        for cog, instance in self.cogs.items():
+            if hasattr(instance,"cache"):
+                instance.cache(data)
+        print("All cogs cached!")
 
     async def on_ready(self):
         print("Bot is online, and cogs are loaded.")
