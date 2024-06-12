@@ -43,6 +43,22 @@ class Mod(commands.Cog):
 
         return commands.check(predicate)
 
+    async def mod_to_member_check(self,ctx:commands.Context,member:discord.Member):
+        bot_top = ctx.guild.get_member(self.client.user.id)
+        bot_top_ob = bot_top.top_role
+        if member.top_role >= bot_top_ob:
+            raise errors.PreRequisiteError(message = f"That user's top role position `({member.top_role.position})` is higher or equal to my top role `({bot_top_ob.position})`.")
+        elif ctx.author.top_role <= member.top_role:
+            raise errors.PreRequisiteError(message = f"That user's top role position `({member.top_role.position})` is higher or equal to your top role `({ctx.author.top_role.position})`.")
+        return True
+
+    async def category_check(self,ctx:commands.Context,category:str):
+        if category and category not in self.categories[ctx.guild.id]:
+                raise errors.ParsingError(
+                    message=f"The category `{category}` is not setup!"
+                )
+        return True
+
     async def pull_initial_expiration(
         self,
         ctx: commands.Context,
@@ -321,13 +337,13 @@ class Mod(commands.Cog):
             if member:
                 await member.remove_roles(
                     (role),
-                    reason=f"{reprimand['action'].capitalize()} has expired.",
+                    reason=preason,
                 )
         elif revoke and reprimand["action"] == "ban":
             try:
                 await guild.unban(
                     user,
-                    reason=f"{reprimand['action'].capitalize()} has expired.",
+                    reason=preason,
                 )
             except:
                 pass
@@ -335,7 +351,7 @@ class Mod(commands.Cog):
             user,
             guild,
             reprimand,
-            f"{reprimand['action'].capitalize()} has expired.",
+            preason,
         )
 
     async def pull_active_total(
@@ -538,10 +554,8 @@ class Mod(commands.Cog):
         reason: str = None,
     ):
         async with ctx.typing():
-            if category and category not in self.categories[ctx.guild.id]:
-                raise errors.ParsingError(
-                    message=f"The category `{category}` is not setup!"
-                )
+            await self.mod_to_member_check(ctx,member)
+            await self.category_check(ctx,category)
             amount = amount or 1
             reprimand = await self.push_reprimand(
                 ctx,
@@ -578,10 +592,8 @@ class Mod(commands.Cog):
         reason: str = None,
     ):
         async with ctx.typing():
-            if category and category not in self.categories[ctx.guild.id]:
-                raise errors.ParsingError(
-                    message=f"The category `{category}` is not setup!"
-                )
+            await self.mod_to_member_check(ctx,member)
+            await self.category_check(ctx,category)
             amount = amount or 1
             reprimand = await self.push_reprimand(
                 ctx,
@@ -599,9 +611,89 @@ class Mod(commands.Cog):
             await self.send_reprimand_dm(
                 member, ctx.guild, reprimand, additional=additional
             )
+    
+    @commands.hybrid_command(aliases=["k"], help="Kick a member")
+    @commands.has_permissions(kick_members = True) 
+    @app_commands.describe(
+        member="The member or user that should be kicked.",
+        category="The category this kick should go in.",
+        reason="Why you are kicking this member.",
+    )
+    async def kick(
+        self,
+        ctx,
+        member: discord.Member,
+        *,
+        category: str = None,
+        reason: str = None,
+    ):
+        async with ctx.typing():
+            await self.mod_to_member_check(ctx,member)
+            await self.category_check(ctx,category)
+            await member.kick(reason=reason)
+            reprimand = await self.push_reprimand(
+                ctx,
+                member,
+                ctx.author,
+                "kick",
+                reason=reason,
+                amount=1,
+                category=category,
+            )
+            additional = await self.trigger_reprimand(ctx, member, reprimand)
+            embed = await self.pull_mod_embed(ctx, member, reprimand, additional)
+            view = ReprimandUpdatePersistentView(ctx, member, reprimand, embed)
+            await ctx.reply(embed=embed, view=view)
+            await self.send_reprimand_dm(
+                member, ctx.guild, reprimand, additional=additional
+            )
+    
+    @commands.hybrid_command(aliases=["b"], help="Ban a member")
+    @commands.has_permissions(ban_members = True) 
+    @app_commands.describe(
+        member="The member or user that should be noticed.",
+        category="The category this notice should go in.",
+        reason="Why you are banning this member or user.",
+        length="How long this member or user should be banned.",
+        delete_days="How many days of messages from this user should be deleted."
+    )
+    async def ban(
+        self,
+        ctx,
+        user: discord.User,
+        *,
+        category: str = None,
+        reason: str = None,
+        length: str = None,
+        delete_days: commands.Range[int, 0, 7] = None
+    ):
+        async with ctx.typing():
+            member = ctx.guild.get_member(user.id)
+            if member:
+                await self.mod_to_member_check(ctx,member)
+            await self.category_check(ctx,category)
+            await ctx.guild.ban(user,reason = reason,delete_message_days=delete_days or 0)
+            reprimand = await self.push_reprimand(
+                ctx,
+                user,
+                ctx.author,
+                "ban",
+                reason=reason,
+                amount=1,
+                category=category,
+                length = length
+            )
+            additional = await self.trigger_reprimand(ctx, user, reprimand)
+            embed = await self.pull_mod_embed(ctx, user, reprimand, additional)
+            view = ReprimandUpdatePersistentView(ctx, user, reprimand, embed)
+            await ctx.reply(embed=embed, view=view)
+            await self.send_reprimand_dm(
+                user, ctx.guild, reprimand, additional=additional
+            )
 
     @warn.autocomplete("category")
     @notice.autocomplete("category")
+    @kick.autocomplete("category")
     async def category_autocomplete(
         self, interaction: discord.Interaction, current: str
     ):
